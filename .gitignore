@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Studio Assets, separated stems, alignments, and temporary files
+studio_assets/
+
+# ONNX model files (since they are huge binaries and should be fetched post-clone)
+piper_models/*.onnx
+piper_models/*.json
+
+# Local temporary/input files
+output.mp4
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
