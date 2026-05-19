@@ -7,18 +7,8 @@ SCRIPT_ROOT = os.path.dirname(os.path.abspath(__file__))
 STUDIO_ASSETS = os.path.join(SCRIPT_ROOT, "studio_assets")
 
 def build_simulation_filter_graph(manifest_data: dict, no_vocals_path: str) -> tuple:
-    """
-    Translates the v3.1 Elastic Timeline specification into a frame-accurate 
-    FFmpeg complex filter graph configuration string.
-    """
-    video_inputs = []
-    audio_inputs = []
-    
     filter_nodes = []
-    
-    # Track the active file indices inside our composite multimedia mix matrix
-    # Input 0 = Source Video, Input 1 = Background Ambiance (no_vocals.wav)
-    # Incoming segment audio assets occupy indices 2, 3, 4... N+2
+    audio_inputs = []
     audio_input_counter = 2
     
     video_segments_out = []
@@ -26,155 +16,137 @@ def build_simulation_filter_graph(manifest_data: dict, no_vocals_path: str) -> t
     ambient_segments_out = []
 
     timeline = manifest_data["playback_timeline"]
+    total_segments = len(timeline)
 
-    for node in timeline:
+    if total_segments == 0:
+        raise ValueError("Cannot compile viewport matrix for an empty playback timeline array.")
+
+    # Up-front architectural pre-splitter mapping pass
+    bg_split_labels = "".join([f"[bg_split_{i}]" for i in range(total_segments)])
+    filter_nodes.append(f"[1:a]asplit=outputs={total_segments}{bg_split_labels}")
+
+    for i, node in enumerate(timeline):
         idx = node["segment_index"]
         start_sec = node["anchor_timestamps"]["start_ms"] / 1000.0
         end_sec = node["anchor_timestamps"]["end_ms"] / 1000.0
-        orig_dur_sec = node["anchor_timestamps"]["original_window_ms"] / 1000.0
         action = node["orchestration"]["timeline_action"]
         action_delta_sec = node["orchestration"]["action_duration_ms"] / 1000.0
         
-        # 🎬 SECTION A: NON-DESTRUCTIVE VIDEO TIMELINE MANIPULATION
-        # Isolate the precise frame window corresponding to this lecture topic slice
-        video_label = f"v_trim_{idx}"
-        filter_nodes.append(
-            f"[0:v]trim=start={start_sec:.4f}:end={end_sec:.4f},setpts=PTS-STARTPTS[{video_label}]"
-        )
-        
+        # 1. Video Track Window Slicing Engine
+        video_trim_label = f"[v_trim_{idx}]"
+        filter_nodes.append(f"[0:v]trim=start={start_sec:.4f}:end={end_sec:.4f},setpts=PTS-STARTPTS{video_trim_label}")
         if action == "FREEZE_HOLD":
-            # State FREEZE_HOLD: Clone the final video frame buffer to let the translation breathe
-            # tpad clone extends the final frame of the video segment cleanly without draining memory
-            frozen_video_label = f"v_frozen_{idx}"
-            filter_nodes.append(
-                f"[{video_label}]tpad=stop_duration={action_delta_sec:.4f}:stop_mode=clone[{frozen_video_label}]"
-            )
-            video_segments_out.append(f"[{frozen_video_label}]")
+            video_frozen_label = f"[v_out_{idx}]"
+            filter_nodes.append(f"{video_trim_label}tpad=stop_duration={action_delta_sec:.4f}:stop_mode=clone{video_frozen_label}")
+            video_segments_out.append(video_frozen_label)
         else:
-            # States NORMAL_SYNC & PAD_EMPTY: Stream frames 1:1 with regular playback speed
-            video_segments_out.append(f"[{video_label}]")
+            video_segments_out.append(video_trim_label)
 
-        # 🎙️ SECTION B: VOCAL STREAM ORCHESTRATION & SILENCE PADDING
-        vocal_label = f"vocal_stream_{idx}"
-        if action == "PAD_EMPTY":
-            # State PAD_EMPTY: Keep true human cadence and fill empty space with trailing silence
-            filter_nodes.append(
-                f"[{audio_input_counter}:a]apad=pad_dur={action_delta_sec:.4f}[{vocal_label}]"
-            )
-        else:
-            filter_nodes.append(
-                f"[{audio_input_counter}:a]asplit=1[{vocal_label}]"
-            )
-        vocal_segments_out.append(f"[{vocal_label}]")
+        # 2. Vocal Stream Normalization (Forces all inputs to perfect Stereo 44100Hz)
+        vocal_raw_label = f"[{audio_input_counter}:a]"
+        vocal_resampled_label = f"[vocal_resamp_{idx}]"
         audio_inputs.append(os.path.join(SCRIPT_ROOT, node["audio_asset"]["local_path"]))
         audio_input_counter += 1
 
-        # 🎚️ SECTION C: PARAMETRIC FREQUENCY-SELECTIVE SIDECHAIN DUCKING
-        # Isolate the background ambiance portion mapping to this segment's window
-        bg_trim_label = f"bg_trim_{idx}"
-        filter_nodes.append(
-            f"[1:a]atrim=start={start_sec:.4f}:end={end_sec:.4f},asetpts=PTS-STARTPTS[{bg_trim_label}]"
-        )
-        
-        # Apply parametric multi-band filtering to protect vocal format intelligibility
-        # We attenuate only the 1kHz-3.5kHz pocket, keeping base room hum completely stable
-        ducked_bg_label = f"bg_ducked_{idx}"
-        duck_db = node["orchestration"]["ambient_ducking_profile"]["duck_attenuation_db"]
-        
-        # If video is frozen, we extend the background noise clip to match the expanded timeline layout
-        bg_paddable_label = f"bg_pad_{idx}"
-        if action == "FREEZE_HOLD":
-            filter_nodes.append(
-                f"[{bg_trim_label}]apad=pad_dur={action_delta_sec:.4f}[{bg_paddable_label}]"
-            )
+        # High-Fidelity Resampling Node Injection Pass
+        filter_nodes.append(f"{vocal_raw_label}aresample=osr=44100:ochl=stereo{vocal_resampled_label}")
+
+        if action == "PAD_EMPTY":
+            vocal_padded_label = f"[vocal_out_{idx}]"
+            filter_nodes.append(f"{vocal_resampled_label}apad=pad_dur={action_delta_sec:.4f}{vocal_padded_label}")
+            vocal_segments_out.append(vocal_padded_label)
         else:
-            filter_nodes.append(f"[{bg_trim_label}]asplit=1[{bg_paddable_label}]")
+            vocal_segments_out.append(vocal_resampled_label)
 
-        filter_nodes.append(
-            f"[{bg_paddable_label}]equalizer=f=2250:width_type=h:width=1250:g={duck_db:.1f}[{ducked_bg_label}]"
-        )
-        ambient_segments_out.append(f"[{ducked_bg_label}]")
+        # 3. Ambient Background Track Slicing Loop
+        bg_cursor_input = f"[bg_split_{i}]"
+        bg_trim_label = f"[bg_trim_{idx}]"
+        filter_nodes.append(f"{bg_cursor_input}atrim=start={start_sec:.4f}:end={end_sec:.4f},asetpts=PTS-STARTPTS{bg_trim_label}")
+        
+        bg_extended_label = f"[bg_ext_{idx}]"
+        if action == "FREEZE_HOLD":
+            filter_nodes.append(f"{bg_trim_label}apad=pad_dur={action_delta_sec:.4f}{bg_extended_label}")
+        else:
+            bg_extended_label = bg_trim_label
+            
+        ambient_segments_out.append(bg_extended_label)
 
-    # 🔗 SECTION D: MASTER CONCATENATION & MULTI-STREAM COMPILE
-    total_video_nodes = len(video_segments_out)
-    concat_video_nodes = "".join(video_segments_out)
-    filter_nodes.append(f"{concat_video_nodes}concat=n={total_video_nodes}:v=1:a=0[master_video_track]")
+    # Macro Track Concatenation Pass
+    concat_video_inputs = "".join(video_segments_out)
+    filter_nodes.append(f"{concat_video_inputs}concat=n={total_segments}:v=1:a=0[master_video_track]")
 
-    total_vocal_nodes = len(vocal_segments_out)
-    concat_vocal_nodes = "".join(vocal_segments_out)
-    filter_nodes.append(f"{concat_vocal_nodes}concat=n={total_vocal_nodes}:v=0:a=1[compiled_vocals]")
+    concat_ambient_inputs = "".join(ambient_segments_out)
+    filter_nodes.append(f"{concat_ambient_inputs}concat=n={total_segments}:v=0:a=1[raw_ambient_track]")
 
-    total_ambient_nodes = len(ambient_segments_out)
-    concat_ambient_nodes = "".join(ambient_segments_out)
-    filter_nodes.append(f"{concat_ambient_nodes}concat=n={total_ambient_nodes}:v=0:a=1[compiled_ambience]")
+    # Vocal OLA Overlap crossfading engine pass
+    if total_segments == 1:
+        filter_nodes.append(f"{vocal_segments_out[0]}anull[compiled_vocals]")
+    else:
+        current_vocal_chain_head = vocal_segments_out[0]
+        for i in range(1, total_segments):
+            next_vocal_segment = vocal_segments_out[i]
+            
+            prev_node_is_gap = timeline[i-1]["is_gap"]
+            curr_node_is_gap = timeline[i]["is_gap"]
+            
+            xfade_buffer_label = f"[v_chain_{i}]"
+            target_out_label = "[compiled_vocals]" if i == (total_segments - 1) else xfade_buffer_label
+            
+            if prev_node_is_gap or curr_node_is_gap:
+                filter_nodes.append(f"{current_vocal_chain_head}{next_vocal_segment}concat=n=2:v=0:a=1{target_out_label}")
+            else:
+                # Optimized configuration targeting total compliance across FFmpeg 8.x environments
+                filter_nodes.append(f"{current_vocal_chain_head}{next_vocal_segment}acrossfade=d=0.08:c1=qsin:c2=qsin{target_out_label}")
+            
+            current_vocal_chain_head = xfade_buffer_label
 
-    # Accumulate and summer both audio layers together cleanly with normalization protections disabled
-    filter_nodes.append("[compiled_vocals][compiled_ambience]amix=inputs=2:duration=longest:normalize=0[master_audio_track]")
+    # 4. Parametric Dynamic Sidechain Ducking Engine Implementation Pass
+    # Split vocals to use as a dynamic volume envelope controller track
+    filter_nodes.append("[compiled_vocals]asplit=2[vocal_playback_track][vocal_sidechain_key]")
+    
+    # Process ambient audio track based on vocal energy levels
+    filter_nodes.append(
+        "[raw_ambient_track][vocal_sidechain_key]sidechaincompress=threshold=0.15:ratio=4:attack=100:release=300[ducked_ambient_track]"
+    )
 
-    full_filter_graph = ";".join(filter_nodes)
-    return full_filter_graph, audio_inputs
+    # Master Mixing and Normalization Pass
+    filter_nodes.append("[vocal_playback_track][ducked_ambient_track]amix=inputs=2:duration=longest:normalize=0[mixed_audio_sum]")
+    filter_nodes.append("[mixed_audio_sum]loudnorm=I=-16:TP=-1.5:LRA=11[master_audio_track]")
+
+    return ";".join(filter_nodes), audio_inputs
 
 def emulate_player_playback(manifest_json_path: str, output_video_path: str):
-    """
-    Reads the data contract manifest and executes an advanced FFmpeg processing pass
-    to render an exact high-fidelity simulation of the native mobile app experience.
-    """
     print(f"\n[PHASE 3] Launching Elastic Playback Emulator Core Simulator...")
-    
     with open(manifest_json_path, "r", encoding="utf-8") as f:
         manifest_data = json.load(f)
 
-    # Resolve primary static source file parameters saved in our assets directory
     video_hash = manifest_data["source_video_hash"]
     checkpoint_path = os.path.join(STUDIO_ASSETS, f"ingestion_checkpoint_{video_hash}.json")
-    
     with open(checkpoint_path, "r", encoding="utf-8") as f:
         checkpoint_data = json.load(f)
         
     source_video = checkpoint_data["source_video_path"]
     no_vocals_wav = checkpoint_data["no_vocals_wav_path"]
 
-    print("   -> Assembling multi-stream matrix components and parametric filter curves...")
     filter_graph, dynamic_audio_inputs = build_simulation_filter_graph(manifest_data, no_vocals_wav)
 
-    # Construct the structural execution parameters for our non-destructive media rendering command
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", source_video,     # Input 0
-        "-i", no_vocals_wav     # Input 1
-    ]
-    
-    # Append the sequence of localized 1.0x human pace local voice stems dynamically
+    cmd = ["ffmpeg", "-y", "-i", source_video, "-i", no_vocals_wav]
     for audio_path in dynamic_audio_inputs:
         cmd.extend(["-i", audio_path])
 
-    # Map the generated graph and enforce professional broadcast loudness leveling targets (-16 LUFS)
     cmd.extend([
-        "-filter_complex", filter_graph,
-        "-map", "[master_video_track]",
-        "-map", "[master_audio_track]",
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11", 
-        "-c:v", "libx264",
-        "-preset", "fast",
-        "-crf", "22",
-        "-c:a", "aac",
-        "-b:a", "192k",
-        "-ar", "44100",
-        output_video_path
+        "-filter_complex", filter_graph, "-map", "[master_video_track]", "-map", "[master_audio_track]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "22", "-c:a", "aac", "-b:a", "192k", "-ar", "44100", output_video_path
     ])
 
     print("   -> Compiling non-destructive media matrix. Processing timeline holds...")
     try:
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         print(f"\n=======================================================")
-        print("🏁 SIMULATOR PLAYBACK COMPLETE: MOBILE EXPERIENCED RENDERED")
+        print("🏁 SIMULATOR PLAYBACK COMPLETE: MOBILE EXPERIENCE RENDERED")
         print(f"📂 High-Fidelity Output Location: {output_video_path}")
         print("=======================================================\n")
     except subprocess.CalledProcessError as e:
-        print(f"\n❌ Playback Emulator Core Exception. FFmpeg processing error code: {e.returncode}")
-
-if __name__ == "__main__":
-    if len(sys.argv) > 2:
-        emulate_player_playback(sys.argv[1], sys.argv[2])
-    else:
-        print("Usage error: Run script passing manifest target path and desired output filename variables.")
+        err_log = e.stderr.decode().strip() if e.stderr else "Unknown FFmpeg Console Panic"
+        print(f"\n❌ Playback Emulator Core Exception:\n{err_log}")
+        raise e

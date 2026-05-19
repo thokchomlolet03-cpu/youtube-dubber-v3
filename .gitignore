@@ -1,5 +1,6 @@
 # Virtual environment
 .venv/
+.venv_ingest/
 venv/
 ENV/
 
@@ -13,11 +14,10 @@ __pycache__/
 studio_assets/
 
 # ONNX model files (since they are huge binaries and should be fetched post-clone)
-piper_models/*.onnx
-piper_models/*.json
+piper_models/
 
 # Local temporary/input files
-output.mp4
+*.mp4
 
 # OS generated files
 .DS_Store
