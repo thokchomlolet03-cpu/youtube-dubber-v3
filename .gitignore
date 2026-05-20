@@ -27,3 +27,10 @@ piper_models/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# Build/runtime directories and packages
+apk_temp/
+compiled_packages/
+omnilect_workspace/
+local_input_pack.zip
+screen.png
